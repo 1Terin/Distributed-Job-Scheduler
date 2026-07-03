@@ -127,6 +127,7 @@ model Job {
   attempt          Int           @default(0)
   maxAttempts      Int           @default(3)
   scheduledAt      DateTime?
+  recurringCron    String?
   availableAt      DateTime      @default(now())
   claimedBy        Worker?       @relation(fields: [claimedById], references: [id])
   claimedById      String?

@@ -12,12 +12,13 @@ async function main() {
 
   const user = await prisma.user.upsert({
     where: { email: "admin@acme.local" },
-    update: {},
+    update: { role: "ADMIN" },
     create: {
       email: "admin@acme.local",
       name: "Admin User",
       passwordHash: await bcrypt.hash("Password123!", 10),
       organizationId: organization.id,
+      role: "ADMIN",
     },
   });
 
@@ -88,6 +89,11 @@ async function main() {
       windowStart: new Date(new Date().setSeconds(0, 0)),
       count: 0,
     },
+  });
+
+  await prisma.queueStatistics.update({
+    where: { queueId: queue.id },
+    data: { totalQueued: 4 },
   });
 
   const immediateJob = await prisma.job.create({

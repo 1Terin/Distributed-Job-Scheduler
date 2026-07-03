@@ -1,8 +1,15 @@
-import prisma from "./db";
+﻿import prisma from "./db";
 import { broadcast } from "./utils/broadcast";
+import parser from "cron-parser";
+import generateFailureSummary from "./utils/failureSummary";
+import { incrementQueueStat } from "./utils/jobStats";
 
 const LOCK_TTL_MS = 30000;
 const SHARD_KEY = process.env.WORKER_SHARD_KEY || null;
+
+let shuttingDown = false;
+let activeWorkerId: string | null = null;
+const runningJobs = new Set<string>();
 
 async function registerWorker() {
   return prisma.worker.create({
@@ -19,34 +26,55 @@ async function heartbeat(workerId: string) {
     data: { workerId, healthy: true, details: "Alive" },
   });
   await prisma.worker.update({ where: { id: workerId }, data: { lastSeenAt: new Date() } });
+
+  // Renew locks for jobs this worker is executing
+  const now = new Date();
+  await prisma.job.updateMany({
+    where: {
+      lockOwner: workerId,
+      status: { in: ["CLAIMED", "RUNNING"] },
+    },
+    data: {
+      lockExpiresAt: new Date(now.getTime() + LOCK_TTL_MS),
+      lastHeartbeatAt: now,
+    },
+  });
+}
+
+async function promoteScheduledJobs() {
+  const now = new Date();
+  const due = await prisma.job.findMany({
+    where: { status: "SCHEDULED", availableAt: { lte: now } },
+    select: { id: true },
+  });
+  if (due.length === 0) return;
+  await prisma.job.updateMany({
+    where: { id: { in: due.map((j) => j.id) } },
+    data: { status: "QUEUED" },
+  });
 }
 
 async function recoverExpiredLocks() {
   const now = new Date();
   await prisma.job.updateMany({
     where: {
-      status: "CLAIMED",
+      status: { in: ["CLAIMED", "RUNNING"] },
       lockExpiresAt: { lte: now },
     },
     data: {
       status: "QUEUED",
       lockOwner: null,
       lockExpiresAt: null,
+      claimedById: null,
+      claimedAt: null,
     },
   });
 }
 
-function generateFailureSummary(error: unknown, attempt: number, maxAttempts: number) {
-  const message = typeof error === "string" ? error : error instanceof Error ? error.message : String(error);
-  const rootCause = message.includes("timeout")
-    ? "Timeout or request latency issue"
-    : message.includes("network")
-    ? "Network or external service failure"
-    : message.includes("syntax")
-    ? "Payload or handler formatting issue"
-    : "Unexpected failure during job execution";
-  const retryInfo = attempt >= maxAttempts ? "No further retries will be attempted." : `Retrying attempt ${attempt + 1} of ${maxAttempts} based on queue retry policy.`;
-  return `${rootCause}: ${message}. ${retryInfo}`;
+async function getQueueInFlight(queueId: string) {
+  return prisma.job.count({
+    where: { queueId, status: { in: ["CLAIMED", "RUNNING"] } },
+  });
 }
 
 async function claimJob(workerId: string) {
@@ -74,12 +102,21 @@ async function claimJob(workerId: string) {
     },
     orderBy: [{ priority: "desc" }, { createdAt: "asc" }],
     take: 20,
+    include: { queue: { include: { retryPolicy: true } } },
   });
 
   for (const candidate of candidates) {
+    const inFlight = await getQueueInFlight(candidate.queueId);
+    if (inFlight >= candidate.queue.concurrency) continue;
+
     const claimed = await prisma.$transaction(async (tx) => {
       const queue = await tx.queue.findUnique({ where: { id: candidate.queueId } });
       if (!queue || queue.paused) return null;
+
+      const currentInFlight = await tx.job.count({
+        where: { queueId: queue.id, status: { in: ["CLAIMED", "RUNNING"] } },
+      });
+      if (currentInFlight >= queue.concurrency) return null;
 
       if (queue.rateLimitPerMinute > 0) {
         let rateWindow = await tx.queueRateWindow.findUnique({ where: { queueId: queue.id } });
@@ -93,10 +130,7 @@ async function claimJob(workerId: string) {
             data: { windowStart, count: 0 },
           });
         }
-
-        if (rateWindow.count >= queue.rateLimitPerMinute) {
-          return null;
-        }
+        if (rateWindow.count >= queue.rateLimitPerMinute) return null;
       }
 
       const updateCount = await tx.job.updateMany({
@@ -111,9 +145,7 @@ async function claimJob(workerId: string) {
         },
       });
 
-      if (updateCount.count !== 1) {
-        return null;
-      }
+      if (updateCount.count !== 1) return null;
 
       if (queue.rateLimitPerMinute > 0) {
         await tx.queueRateWindow.update({
@@ -122,7 +154,10 @@ async function claimJob(workerId: string) {
         });
       }
 
-      return tx.job.findUnique({ where: { id: candidate.id } });
+      return tx.job.findUnique({
+        where: { id: candidate.id },
+        include: { queue: { include: { retryPolicy: true } } },
+      });
     });
 
     if (claimed) {
@@ -134,10 +169,43 @@ async function claimJob(workerId: string) {
   return null;
 }
 
+async function scheduleRecurring(job: any) {
+  if (!job.recurringCron) return;
+  try {
+    const interval = parser.parseExpression(job.recurringCron, { utc: true });
+    const next = interval.next().toDate();
+    const newJob = await prisma.job.create({
+      data: {
+        queueId: job.queueId,
+        projectId: job.projectId,
+        type: job.type,
+        payload: job.payload,
+        priority: job.priority,
+        status: "SCHEDULED",
+        scheduledAt: next,
+        recurringCron: job.recurringCron,
+        availableAt: next,
+        maxAttempts: job.maxAttempts ?? 3,
+      },
+    });
+    await incrementQueueStat(job.queueId, "totalQueued");
+    broadcast({ type: "job_created", jobId: newJob.id, status: newJob.status, queueId: job.queueId });
+  } catch (err) {
+    console.error("Failed to schedule next recurring job:", err);
+  }
+}
+
 async function executeJob(job: any) {
   const attemptNumber = job.attempt + 1;
-  const startTime = new Date();
-  await prisma.jobExecution.create({
+  runningJobs.add(job.id);
+
+  await prisma.job.update({
+    where: { id: job.id },
+    data: { status: "RUNNING" },
+  });
+  broadcast({ type: "job_running", jobId: job.id, workerId: job.claimedById, queueId: job.queueId });
+
+  const execution = await prisma.jobExecution.create({
     data: {
       jobId: job.id,
       workerId: job.claimedById,
@@ -145,6 +213,7 @@ async function executeJob(job: any) {
       status: "STARTED",
     },
   });
+
   await prisma.jobLog.create({
     data: {
       jobId: job.id,
@@ -152,6 +221,9 @@ async function executeJob(job: any) {
       level: "INFO",
     },
   });
+
+  const policy = job.queue?.retryPolicy;
+  const maxAttempts = policy?.maxAttempts ?? job.maxAttempts ?? 3;
 
   try {
     const payload = job.payload ? JSON.parse(job.payload) : {};
@@ -169,42 +241,37 @@ async function executeJob(job: any) {
         completedAt: new Date(),
         lockOwner: null,
         lockExpiresAt: null,
+        claimedById: null,
+        claimedAt: null,
       },
     });
 
-    await prisma.jobExecution.updateMany({
-      where: { jobId: job.id, status: "STARTED" },
+    await prisma.jobExecution.update({
+      where: { id: execution.id },
       data: { status: "SUCCEEDED", finishedAt: new Date(), durationMs },
     });
 
-    await prisma.queueStatistics.upsert({
-      where: { queueId: job.queueId },
-      create: {
-        queueId: job.queueId,
-        totalQueued: 0,
-        totalCompleted: 1,
-        totalFailed: 0,
-        totalRetried: 0,
-        totalDeadLetter: 0,
-      },
-      update: {
-        totalCompleted: { increment: 1 },
-      },
-    });
+    await incrementQueueStat(job.queueId, "totalCompleted");
 
     await prisma.jobLog.create({
-      data: {
-        jobId: job.id,
-        message: "Job completed successfully.",
-        level: "INFO",
-      },
+      data: { jobId: job.id, message: "Job completed successfully.", level: "INFO" },
     });
 
     broadcast({ type: "job_completed", jobId: job.id, queueId: job.queueId });
+    await scheduleRecurring(job);
   } catch (error: any) {
-    const maxAttempts = job.maxAttempts ?? 3;
-    const summary = generateFailureSummary(error, attemptNumber, maxAttempts);
-    const nextRetry = new Date(Date.now() + 30000);
+    const summary = await generateFailureSummary(error, attemptNumber, maxAttempts);
+    const baseDelaySeconds = policy?.delaySeconds ?? 30;
+    const strategy = policy?.strategy ?? "FIXED";
+
+    let delaySeconds = baseDelaySeconds;
+    if (strategy === "LINEAR") {
+      delaySeconds = baseDelaySeconds * attemptNumber;
+    } else if (strategy === "EXPONENTIAL") {
+      delaySeconds = baseDelaySeconds * Math.pow(2, attemptNumber - 1);
+    }
+
+    const nextRetry = new Date(Date.now() + delaySeconds * 1000);
     const isRetryable = attemptNumber < maxAttempts;
     const newStatus = isRetryable ? "QUEUED" : "FAILED";
 
@@ -216,13 +283,16 @@ async function executeJob(job: any) {
         lastError: String(error.message || error),
         failureSummary: summary,
         nextRetryAt: isRetryable ? nextRetry : null,
+        availableAt: isRetryable ? nextRetry : job.availableAt,
         lockOwner: null,
         lockExpiresAt: null,
+        claimedById: null,
+        claimedAt: null,
       },
     });
 
-    await prisma.jobExecution.updateMany({
-      where: { jobId: job.id, status: "STARTED" },
+    await prisma.jobExecution.update({
+      where: { id: execution.id },
       data: {
         status: "FAILED",
         finishedAt: new Date(),
@@ -240,66 +310,86 @@ async function executeJob(job: any) {
     });
 
     if (!isRetryable) {
-      await prisma.deadLetter.create({
-        data: {
-          jobId: job.id,
-          reason: String(error.message || error),
-        },
+      await prisma.deadLetter.upsert({
+        where: { jobId: job.id },
+        create: { jobId: job.id, reason: String(error.message || error) },
+        update: { reason: String(error.message || error), failedAt: new Date() },
       });
-      await prisma.queueStatistics.upsert({
-        where: { queueId: job.queueId },
-        create: {
-          queueId: job.queueId,
-          totalQueued: 0,
-          totalCompleted: 0,
-          totalFailed: 1,
-          totalRetried: 0,
-          totalDeadLetter: 1,
-        },
-        update: {
-          totalFailed: { increment: 1 },
-          totalDeadLetter: { increment: 1 },
-        },
-      });
+      await incrementQueueStat(job.queueId, "totalFailed");
+      await incrementQueueStat(job.queueId, "totalDeadLetter");
       broadcast({ type: "job_dead_letter", jobId: job.id, queueId: job.queueId });
     } else {
-      await prisma.queueStatistics.upsert({
-        where: { queueId: job.queueId },
-        create: {
-          queueId: job.queueId,
-          totalQueued: 0,
-          totalCompleted: 0,
-          totalFailed: 0,
-          totalRetried: 1,
-          totalDeadLetter: 0,
-        },
-        update: {
-          totalRetried: { increment: 1 },
-        },
-      });
+      await incrementQueueStat(job.queueId, "totalRetried");
       broadcast({ type: "job_requeued", jobId: job.id, queueId: job.queueId });
     }
+  } finally {
+    runningJobs.delete(job.id);
   }
+}
+
+async function releaseWorkerJobs(workerId: string) {
+  await prisma.job.updateMany({
+    where: {
+      claimedById: workerId,
+      status: { in: ["CLAIMED", "RUNNING"] },
+    },
+    data: {
+      status: "QUEUED",
+      lockOwner: null,
+      lockExpiresAt: null,
+      claimedById: null,
+      claimedAt: null,
+    },
+  });
 }
 
 async function run() {
   const worker = await registerWorker();
+  activeWorkerId = worker.id;
   console.log(`Worker registered ${worker.id}`);
 
-  process.on("SIGINT", async () => {
-    console.log("Worker shutting down");
-    process.exit(0);
-  });
-
-  while (true) {
-    await heartbeat(worker.id);
-    await recoverExpiredLocks();
-    const job = await claimJob(worker.id);
-    if (job) {
-      await executeJob(job);
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log("Worker shutting down gracefully...");
+    while (runningJobs.size > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
+    if (activeWorkerId) await releaseWorkerJobs(activeWorkerId);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  const WORKER_CONCURRENCY = Number(process.env.WORKER_CONCURRENCY || "1");
+
+  while (!shuttingDown) {
+    await heartbeat(worker.id);
+    await promoteScheduledJobs();
+    await recoverExpiredLocks();
+
+    const claimedJobs: any[] = [];
+    for (let i = 0; i < WORKER_CONCURRENCY; i++) {
+      const j = await claimJob(worker.id);
+      if (j) claimedJobs.push(j);
+      else break;
+    }
+
+    if (claimedJobs.length === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      continue;
+    }
+
+    await Promise.all(
+      claimedJobs.map(async (job) => {
+        try {
+          await executeJob(job);
+        } catch (err) {
+          console.error("Error executing job:", err);
+        }
+      })
+    );
   }
 }
 

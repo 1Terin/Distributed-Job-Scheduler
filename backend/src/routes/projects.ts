@@ -19,7 +19,7 @@ router.post("/", async (req: AuthRequest, res, next) => {
       },
     });
 
-    res.json(project);
+    res.status(201).json(project);
   } catch (error) {
     next(error);
   }
@@ -28,10 +28,24 @@ router.post("/", async (req: AuthRequest, res, next) => {
 router.get("/", async (req: AuthRequest, res, next) => {
   try {
     const projects = await prisma.project.findMany({
-      where: { organizationId: req.user!.id },
+      where: { organizationId: req.user!.organizationId },
+      include: { _count: { select: { queues: true, jobs: true } } },
       orderBy: { createdAt: "desc" },
     });
     res.json(projects);
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get("/:id", async (req: AuthRequest, res, next) => {
+  try {
+    const project = await prisma.project.findFirst({
+      where: { id: req.params.id, organizationId: req.user!.organizationId },
+      include: { queues: { include: { statistics: true } } },
+    });
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    res.json(project);
   } catch (error) {
     next(error);
   }
