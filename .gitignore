@@ -25,8 +25,8 @@ pnpm-debug.log*
 *.tsbuildinfo
 
 # Prisma
-/prisma/migrations/
-/prisma/dev.db
+/backend/prisma/migrations/
+/backend/prisma/dev.db
 
 # OS
 .DS_Store
